@@ -90,7 +90,7 @@ defmodule Mix.Tasks.Ash.Gen.Resource do
     data = gather_table_data(table_name, ecto_info)
 
     # Generate the file content
-    content = generate_resource_content(table_name, module_name, data)
+    content = generate_resource_content(table_name, module_name, data, ecto_info)
 
     # Write the file
     File.write!(file_name, content)
@@ -276,7 +276,7 @@ defmodule Mix.Tasks.Ash.Gen.Resource do
     }
   end
 
-  defp generate_resource_content(table_name, module_name, data) do
+  defp generate_resource_content(table_name, module_name, data, ecto_info) do
     lines = []
 
     # Module definition
@@ -300,8 +300,9 @@ defmodule Mix.Tasks.Ash.Gen.Resource do
     # Identities section
     lines = lines ++ generate_identities_section(data)
 
-    # Relationships section
-    lines = lines ++ generate_relationships_section(data)
+    # Relationships section - now pass ecto_info
+    data_with_ecto = Map.put(data, :ecto_info, ecto_info)
+    lines = lines ++ generate_relationships_section(data_with_ecto)
 
     # Actions section
     lines = lines ++ generate_actions_section()
@@ -427,9 +428,219 @@ defmodule Mix.Tasks.Ash.Gen.Resource do
     end
   end
 
-  defp generate_relationships_section(_data) do
-    # For now, just return empty - can be enhanced later
-    []
+  defp generate_relationships_section(data) do
+    %{fk_constraints: fk_constraints, reverse_fks: reverse_fks} = data
+
+    # Get Ecto info if available (passed through data)
+    ecto_info = Map.get(data, :ecto_info, %{})
+
+    # Check if we have any relationships to generate
+    has_relationships = fk_constraints != [] or reverse_fks != [] or has_ecto_associations?(ecto_info)
+
+    if has_relationships do
+      lines = ["  relationships do"]
+
+      # Generate belongs_to relationships from foreign keys
+      belongs_to_lines = generate_belongs_to_relationships(fk_constraints, ecto_info)
+
+      # Generate has_many relationships from reverse foreign keys
+      has_many_lines = generate_has_many_relationships(reverse_fks, ecto_info)
+
+      # Generate many_to_many relationships from Ecto schema
+      many_to_many_lines = generate_many_to_many_relationships(ecto_info)
+
+      # Add additional relationships from Ecto that we might have missed
+      additional_lines = generate_additional_ecto_relationships(ecto_info, fk_constraints, reverse_fks)
+
+      all_relationship_lines = belongs_to_lines ++ has_many_lines ++ many_to_many_lines ++ additional_lines
+
+      if all_relationship_lines != [] do
+        lines ++ all_relationship_lines ++ ["  end", ""]
+      else
+        []
+      end
+    else
+      []
+    end
+  end
+
+  defp generate_belongs_to_relationships(fk_constraints, ecto_info) do
+    fk_constraints
+    |> Enum.map(fn [col, foreign_table, foreign_col, _constraint_name] ->
+      relationship_name =
+        get_ecto_association_name(col, foreign_table, ecto_info) ||
+          infer_relationship_name(col, foreign_table)
+
+      foreign_resource = moduleize(foreign_table)
+
+      [
+        "    belongs_to :#{relationship_name}, #{foreign_resource} do",
+        "      source_field :#{col}",
+        "      destination_field :#{foreign_col}",
+        "    end"
+      ]
+    end)
+    |> List.flatten()
+  end
+
+  defp generate_has_many_relationships(reverse_fks, ecto_info) do
+    reverse_fks
+    |> Enum.map(fn [source_table, source_column, target_column] ->
+      relationship_name =
+        get_ecto_has_many_name(source_table, ecto_info) ||
+          pluralize(source_table)
+
+      source_resource = moduleize(source_table)
+
+      [
+        "    has_many :#{relationship_name}, #{source_resource} do",
+        "      source_field :#{target_column}",
+        "      destination_field :#{source_column}",
+        "    end"
+      ]
+    end)
+    |> List.flatten()
+  end
+
+  defp generate_many_to_many_relationships(ecto_info) do
+    associations = Map.get(ecto_info, :associations, [])
+
+    associations
+    |> Enum.filter(fn
+      {:many_to_many, _, _, _} -> true
+      _ -> false
+    end)
+    |> Enum.map(fn {:many_to_many, name, module, join_table} ->
+      [
+        "    many_to_many :#{name}, #{module} do",
+        "      through #{moduleize(join_table)}",
+        "    end"
+      ]
+    end)
+    |> List.flatten()
+  end
+
+  defp generate_additional_ecto_relationships(ecto_info, fk_constraints, reverse_fks) do
+    associations = Map.get(ecto_info, :associations, [])
+
+    # Get relationship names that we've already handled
+    handled_belongs_to = fk_constraints |> Enum.map(fn [col, _, _, _] -> String.replace(col, "_id", "") end)
+    handled_has_many = reverse_fks |> Enum.map(fn [source_table, _, _] -> pluralize(source_table) end)
+
+    # Find Ecto associations that weren't covered by database constraints
+    additional_relationships =
+      associations
+      |> Enum.filter(fn
+        {:belongs_to, name, _module, _} ->
+          name not in handled_belongs_to
+
+        {:has_many, name, _module, _} ->
+          name not in handled_has_many
+
+        {:has_one, name, _module, _} ->
+          # Always include has_one since we don't detect these from DB
+          true
+
+        {:many_to_many, _, _, _} ->
+          # Already handled above
+          false
+      end)
+      |> Enum.map(fn
+        {:belongs_to, name, module, _} ->
+          [
+            "    # TODO: belongs_to :#{name}, #{module} - no foreign key found in database",
+            "    # Add foreign key constraint or define manually"
+          ]
+
+        {:has_many, name, module, _} ->
+          [
+            "    # TODO: has_many :#{name}, #{module} - no reverse foreign key found",
+            "    # Verify the foreign key exists in #{module} table"
+          ]
+
+        {:has_one, name, module, _} ->
+          [
+            "    # TODO: has_one :#{name}, #{module} - define manually",
+            "    # has_one :#{name}, #{module} do",
+            "    #   source_field :id",
+            "    #   destination_field :source_table_id",
+            "    # end"
+          ]
+      end)
+      |> List.flatten()
+
+    if additional_relationships != [] do
+      [""] ++ additional_relationships
+    else
+      []
+    end
+  end
+
+  defp has_ecto_associations?(ecto_info) do
+    associations = Map.get(ecto_info, :associations, [])
+    length(associations) > 0
+  end
+
+  defp get_ecto_association_name(column, _table, ecto_info) do
+    associations = Map.get(ecto_info, :associations, [])
+
+    # Look for belongs_to associations that might match this column
+    Enum.find_value(associations, fn
+      {:belongs_to, name, _module, _} ->
+        if "#{name}_id" == column, do: name, else: nil
+
+      _ ->
+        nil
+    end)
+  end
+
+  defp get_ecto_has_many_name(source_table, ecto_info) do
+    associations = Map.get(ecto_info, :associations, [])
+
+    # Look for has_many associations that might match this table
+    Enum.find_value(associations, fn
+      {:has_many, name, module, _} ->
+        # Try to match by module name to table name
+        if module_to_table_name(module) == source_table, do: name, else: nil
+
+      _ ->
+        nil
+    end)
+  end
+
+  defp module_to_table_name(module_string) do
+    # Convert "MyApp.Blog.Post" to "posts"
+    module_string
+    |> String.split(".")
+    |> List.last()
+    |> then(fn name ->
+      name
+      |> String.replace(~r/([A-Z])/, "_\\1")
+      |> String.downcase()
+      |> String.trim_leading("_")
+      |> pluralize()
+    end)
+  end
+
+  defp infer_relationship_name(column_name, foreign_table) do
+    cond do
+      String.ends_with?(column_name, "_id") ->
+        String.trim_trailing(column_name, "_id")
+
+      true ->
+        # Simple singularization
+        String.trim_trailing(foreign_table, "s")
+    end
+  end
+
+  defp pluralize(word) do
+    # Simple pluralization - you might want to use a library like Inflex
+    cond do
+      String.ends_with?(word, "s") -> word
+      String.ends_with?(word, "y") -> String.slice(word, 0..-2//-1) <> "ies"
+      String.ends_with?(word, ["ch", "sh", "x", "z"]) -> word <> "es"
+      true -> word <> "s"
+    end
   end
 
   defp generate_actions_section() do
@@ -458,9 +669,9 @@ defmodule Mix.Tasks.Ash.Gen.Resource do
     IO.puts("   • #{length(enum_types)} enum type(s)")
 
     if ecto_info != %{} do
-      virtual_count = count_virtual_fields(ecto_info)
-      validation_count = count_validations(ecto_info)
-      association_count = count_associations(ecto_info)
+      virtual_count = length(Map.get(ecto_info, :virtual_fields, []))
+      validation_count = length(Map.get(ecto_info, :validations, []))
+      association_count = length(Map.get(ecto_info, :associations, []))
       IO.puts("   • #{virtual_count} virtual field(s) from Ecto")
       IO.puts("   • #{validation_count} validation(s) from Ecto")
       IO.puts("   • #{association_count} association(s) from Ecto")
@@ -671,10 +882,6 @@ defmodule Mix.Tasks.Ash.Gen.Resource do
       ", constraints: [" <> Enum.join(constraints, ", ") <> "]"
     end
   end
-
-  defp count_virtual_fields(ecto_info), do: length(Map.get(ecto_info, :virtual_fields, []))
-  defp count_validations(ecto_info), do: length(Map.get(ecto_info, :validations, []))
-  defp count_associations(ecto_info), do: length(Map.get(ecto_info, :associations, []))
 
   defp moduleize(table) do
     "GMiner.Resources." <>
